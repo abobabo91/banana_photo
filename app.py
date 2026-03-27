@@ -27,7 +27,7 @@ MODELS = {
         "input_text_per_1m": 0.50,
         "input_image_per_1m": 0.50,
         "output_per_1m": 60.00,
-        "price_hint": "About 0.045 USD for 512x512, 0.067 USD for 1024x1024, 0.101 USD for 2048x2048, and 0.151 USD for 4096x4096.",
+        "price_hint": "About 0.045 USD for 512x512 \n 0.067 USD for 1024x1024, 0.101 USD for 2048x2048, and 0.151 USD for 4096x4096.",
         "default_output_tokens": 1120,
     },
     "gemini-3-pro-image-preview": {
