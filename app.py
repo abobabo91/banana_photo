@@ -182,11 +182,8 @@ with st.sidebar:
     selected_account = ACCOUNT_KEYS[selected_account_idx]
 
     # Per-account spend totals
-    st.markdown(
-        f"<small>Barabasi total: <b>${st.session_state['total_spent_barabasi']:.2f}</b><br>"
-        f"Abel total: <b>${st.session_state['total_spent_abel']:.2f}</b></small>",
-        unsafe_allow_html=True,
-    )
+    st.caption(f"Barabasi total: ${st.session_state['total_spent_barabasi']:.2f}")
+    st.caption(f"Abel total: ${st.session_state['total_spent_abel']:.2f}")
 
     st.divider()
 
