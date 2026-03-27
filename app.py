@@ -164,24 +164,48 @@ def call_gemini(api_key: str, model_key: str, images: list, prompt: str):
         config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]),
     )
 
+    candidates = getattr(response, "candidates", None) or []
     result_bytes = None
-    result_text = None
-    for part in response.candidates[0].content.parts:
-        if part.inline_data is not None:
-            result_bytes = part.inline_data.data
-        elif part.text:
-            result_text = part.text
+    text_parts = []
 
-    return result_bytes, result_text, response.usage_metadata
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        candidate_parts = getattr(content, "parts", None) or []
+        for part in candidate_parts:
+            inline_data = getattr(part, "inline_data", None)
+            inline_bytes = getattr(inline_data, "data", None) if inline_data is not None else None
+            if inline_bytes:
+                result_bytes = inline_bytes
+
+            part_text = getattr(part, "text", None)
+            if part_text:
+                text_parts.append(part_text)
+
+    result_text = "\n".join(text_parts).strip() or None
+    if result_bytes or result_text:
+        return result_bytes, result_text, getattr(response, "usage_metadata", None)
+
+    fallback_text = getattr(response, "text", None)
+    if fallback_text:
+        return None, fallback_text, getattr(response, "usage_metadata", None)
+
+    finish_reasons = [
+        str(getattr(candidate, "finish_reason", "unknown"))
+        for candidate in candidates
+        if getattr(candidate, "finish_reason", None) is not None
+    ]
+    reason_suffix = f" Finish reason: {', '.join(finish_reasons)}." if finish_reasons else ""
+    raise RuntimeError(f"Gemini returned no image or text content.{reason_suffix}")
 
 
-def render_saved_result(result_slot, cost_slot) -> None:
+def render_saved_result(result_slot, cost_slot, show_empty_hint: bool = True) -> None:
     """Render the latest successful result so it survives reruns."""
     latest_result = st.session_state.get("latest_result")
 
     if not latest_result:
-        with result_slot.container():
-            st.caption("The latest generated image stays here until the next successful edit or `Start New`.")
+        if show_empty_hint:
+            with result_slot.container():
+                st.caption("The latest generated image stays here until the next successful edit or `Start New`.")
         return
 
     with result_slot.container():
@@ -442,4 +466,4 @@ if notice_type:
         if notice_caption:
             st.caption(notice_caption)
 
-render_saved_result(result_slot, cost_slot)
+render_saved_result(result_slot, cost_slot, show_empty_hint=not bool(notice_type))
