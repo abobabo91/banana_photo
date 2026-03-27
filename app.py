@@ -27,7 +27,7 @@ MODELS = {
         "input_text_per_1m": 0.50,
         "input_image_per_1m": 0.50,
         "output_per_1m": 60.00,
-        "price_hint": "About 0.045 USD for 512x512 \n 0.067 USD for 1024x1024, 0.101 USD for 2048x2048, and 0.151 USD for 4096x4096.",
+        "price_hint": "About 0.045 USD for 512x512.\nAbout 0.067 USD for 1024x1024.\nAbout 0.101 USD for 2048x2048.\nAbout 0.151 USD for 4096x4096.",
         "default_output_tokens": 1120,
     },
     "gemini-3-pro-image-preview": {
@@ -36,7 +36,7 @@ MODELS = {
         "input_text_per_1m": 2.00,
         "input_image_per_1m": 2.00,
         "output_per_1m": 120.00,
-        "price_hint": "Input images cost about 0.0011 USD each. Output images cost about 0.134 USD for 1024x1024 to 2048x2048, and 0.24 USD for 4096x4096.",
+        "price_hint": "Input images cost about 0.0011 USD each.\nOutput is about 0.134 USD for 1024x1024 to 2048x2048.\nOutput is about 0.24 USD for 4096x4096.",
         "default_output_tokens": 1120,
     },
     "gemini-2.5-flash-image": {
@@ -297,7 +297,7 @@ with st.sidebar:
     cfg = MODELS[selected_model]
 
     st.write(cfg["description"])
-    st.write(cfg["price_hint"])
+    st.text(cfg["price_hint"])
     if not cfg.get("pricing_available", True):
         st.write("Current Google pricing marks image generation for this legacy model as unavailable.")
 
