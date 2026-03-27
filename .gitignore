@@ -21,6 +21,7 @@ ENV/
 
 # Persistent cost tracking (local only)
 costs.json
+workspace/
 
 # OS
 .DS_Store
