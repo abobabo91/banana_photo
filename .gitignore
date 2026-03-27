@@ -19,6 +19,9 @@ ENV/
 # Streamlit cache
 .streamlit/cache/
 
+# Persistent cost tracking (local only)
+costs.json
+
 # OS
 .DS_Store
 Thumbs.db

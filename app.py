@@ -3,7 +3,26 @@ from google import genai
 from google.genai import types
 from PIL import Image
 import io
+import json
 import math
+from pathlib import Path
+
+COSTS_FILE = Path(__file__).parent / "costs.json"
+
+
+def load_costs() -> dict:
+    """Read persisted totals from disk, or return zeroes if file doesn't exist yet."""
+    if COSTS_FILE.exists():
+        try:
+            return json.loads(COSTS_FILE.read_text())
+        except Exception:
+            pass
+    return {a: 0.0 for a in ["barabasi", "abel"]}
+
+
+def save_costs(totals: dict) -> None:
+    """Write current totals to disk."""
+    COSTS_FILE.write_text(json.dumps(totals, indent=2))
 
 st.set_page_config(
     page_title="Gemini Image Editor",
@@ -59,10 +78,12 @@ DEFAULT_IDX = 0  # gemini-3.1-flash-image-preview
 
 
 # ── Session state init ─────────────────────────────────────────────────────────
-# Cost totals persist across "Start New" — only reset on full page reload
-for acct in ACCOUNT_KEYS:
-    if f"total_spent_{acct}" not in st.session_state:
-        st.session_state[f"total_spent_{acct}"] = 0.0
+# Seed from disk once per browser session so totals survive app restarts
+if "costs_loaded" not in st.session_state:
+    persisted = load_costs()
+    for acct in ACCOUNT_KEYS:
+        st.session_state[f"total_spent_{acct}"] = persisted.get(acct, 0.0)
+    st.session_state["costs_loaded"] = True
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -137,11 +158,14 @@ with st.sidebar:
     st.divider()
 
     if st.button("🗑️ Start New", use_container_width=True):
-        # Preserve cost totals, clear everything else
-        saved = {f"total_spent_{a}": st.session_state[f"total_spent_{a}"] for a in ACCOUNT_KEYS}
+        # Clear workspace but keep persisted cost totals
         for key in list(st.session_state.keys()):
             del st.session_state[key]
-        st.session_state.update(saved)
+        # Re-seed from disk so the sidebar totals stay correct
+        persisted = load_costs()
+        for acct in ACCOUNT_KEYS:
+            st.session_state[f"total_spent_{acct}"] = persisted.get(acct, 0.0)
+        st.session_state["costs_loaded"] = True
         st.rerun()
 
     st.divider()
@@ -158,9 +182,10 @@ with st.sidebar:
     selected_account = ACCOUNT_KEYS[selected_account_idx]
 
     # Per-account spend totals
-    st.caption(
-        f"Barabasi total: **${st.session_state['total_spent_barabasi']:.2f}**  \n"
-        f"Abel total: **${st.session_state['total_spent_abel']:.2f}**"
+    st.markdown(
+        f"<small>Barabasi total: <b>${st.session_state['total_spent_barabasi']:.2f}</b><br>"
+        f"Abel total: <b>${st.session_state['total_spent_abel']:.2f}</b></small>",
+        unsafe_allow_html=True,
     )
 
     st.divider()
@@ -272,8 +297,9 @@ if submit and uploaded_files and prompt.strip():
 
         costs = compute_cost(selected_model, input_text_tok, total_img_tokens, output_tok)
 
-        # Accumulate into the active account's running total
+        # Accumulate into the active account's running total and persist to disk
         st.session_state[f"total_spent_{selected_account}"] += costs["total"]
+        save_costs({a: st.session_state[f"total_spent_{a}"] for a in ACCOUNT_KEYS})
 
         with cost_slot.container():
             st.divider()
