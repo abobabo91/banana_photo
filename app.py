@@ -404,8 +404,20 @@ if submit:
                     prompt.strip(),
                 )
         except Exception as exc:
-            notice_type = "error"
-            notice_message = f"API error: {exc}"
+            exc_str = str(exc)
+            if "503" in exc_str or "UNAVAILABLE" in exc_str or "Deadline" in exc_str:
+                notice_type = "error"
+                notice_message = "Google's servers took too long to respond and the request timed out."
+                notice_caption = (
+                    "**What you can try:**\n"
+                    "- **Try again** — this is usually a temporary overload on Google's side\n"
+                    "- **Use a smaller image** — large images take longer to process and are more likely to time out\n"
+                    "- **Switch to Gemini 2.5 Flash Image** in the sidebar — it's the stable production model and handles load better than the preview models\n"
+                    "- **Try a different model** if one preview model keeps failing"
+                )
+            else:
+                notice_type = "error"
+                notice_message = f"API error: {exc}"
         else:
             if result_bytes:
                 result_img = Image.open(io.BytesIO(result_bytes))
