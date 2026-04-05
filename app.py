@@ -53,6 +53,8 @@ MODELS = {
 }
 MODEL_KEYS = list(MODELS.keys())
 DEFAULT_IDX = 0
+EDITOR_MODES = ["basic", "advanced"]
+DEFAULT_EDITOR_MODE = 1
 
 
 def load_costs() -> dict:
@@ -265,6 +267,16 @@ def register_point_click(image_id: str, click_value: dict | None, image_size: tu
     return True
 
 
+def load_marker_font(font_size: int) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
+    """Try a few common fonts so numbered markers stay readable."""
+    for font_name in ("arialbd.ttf", "arial.ttf", "DejaVuSans-Bold.ttf", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(font_name, font_size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
 def render_point_preview(source_image: Image.Image, points: list[dict]) -> Image.Image:
     """Draw numbered reference markers on top of the uploaded image for clicking."""
     preview = source_image.convert("RGBA").copy()
@@ -293,6 +305,90 @@ def render_point_preview(source_image: Image.Image, points: list[dict]) -> Image
         draw.text((text_x, text_y), label, fill=(255, 255, 255, 255), font=font)
 
     return preview
+
+
+def render_annotated_reference_image(source_image: Image.Image, points: list[dict]) -> Image.Image:
+    """Draw readable numbered callouts so Gemini can align each point visually."""
+    annotated = source_image.convert("RGBA").copy()
+    if not points:
+        return annotated
+
+    draw = ImageDraw.Draw(annotated)
+    image_width, image_height = annotated.size
+    base_size = min(image_width, image_height)
+    target_radius = max(8, min(18, round(base_size * 0.012)))
+    badge_radius = max(16, min(34, round(base_size * 0.028)))
+    badge_offset = max(30, round(base_size * 0.06))
+    line_width = max(3, round(target_radius * 0.35))
+    font = load_marker_font(max(16, round(badge_radius * 1.1)))
+
+    for point_number, point in enumerate(points, start=1):
+        x = point["x"]
+        y = point["y"]
+        label = str(point_number)
+
+        x_direction = 1 if x < image_width / 2 else -1
+        y_direction = -1 if y > image_height * 0.3 else 1
+        badge_x = min(max(x + (badge_offset * x_direction), badge_radius + 8), image_width - badge_radius - 8)
+        badge_y = min(max(y + (badge_offset * y_direction), badge_radius + 8), image_height - badge_radius - 8)
+
+        # Exact target marker: a bullseye plus crosshair centered on the clicked point.
+        draw.line((x - target_radius * 1.5, y, x + target_radius * 1.5, y), fill=(255, 255, 255, 255), width=line_width)
+        draw.line((x, y - target_radius * 1.5, x, y + target_radius * 1.5), fill=(255, 255, 255, 255), width=line_width)
+        draw.ellipse(
+            (x - target_radius, y - target_radius, x + target_radius, y + target_radius),
+            outline=(255, 255, 255, 255),
+            width=line_width,
+        )
+        draw.ellipse(
+            (x - max(4, target_radius // 2), y - max(4, target_radius // 2), x + max(4, target_radius // 2), y + max(4, target_radius // 2)),
+            fill=(231, 76, 60, 255),
+            outline=(255, 255, 255, 255),
+            width=max(2, line_width - 1),
+        )
+
+        # Number label: offset badge connected by a line so the target center stays unambiguous.
+        draw.line((x, y, badge_x, badge_y), fill=(255, 215, 0, 255), width=max(2, line_width - 1))
+        draw.ellipse(
+            (badge_x - badge_radius, badge_y - badge_radius, badge_x + badge_radius, badge_y + badge_radius),
+            fill=(255, 215, 0, 245),
+            outline=(32, 32, 32, 255),
+            width=max(2, round(badge_radius * 0.12)),
+        )
+        left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
+        draw.text(
+            (badge_x - ((right - left) / 2), badge_y - ((bottom - top) / 2)),
+            label,
+            fill=(25, 25, 25, 255),
+            font=font,
+        )
+
+    return annotated
+
+
+def build_annotated_reference_images(prepared_images: list[dict]) -> list[dict]:
+    """Create visual numbered overlays to send as extra Gemini reference images."""
+    point_store = st.session_state.get("image_points", {})
+    annotated_references = []
+
+    for image in prepared_images:
+        points = point_store.get(image["id"], [])
+        if not points:
+            continue
+
+        annotated_image = render_annotated_reference_image(image["pil_image"], points)
+        buffer = io.BytesIO()
+        annotated_image.save(buffer, format="PNG")
+        annotated_references.append(
+            {
+                "image_number": image["index"],
+                "image_ordinal": ordinal(image["index"]),
+                "png_bytes": buffer.getvalue(),
+                "size": annotated_image.size,
+            }
+        )
+
+    return annotated_references
 
 
 def build_point_reference_text(prepared_images: list[dict]) -> str | None:
@@ -330,6 +426,10 @@ def build_point_reference_text(prepared_images: list[dict]) -> str | None:
         return None
 
     return (
+        "[Annotated references]\n"
+        "Extra numbered reference image overlays are also provided. "
+        "Each point number is shown as a yellow badge connected to a bullseye target.\n"
+        "The exact location is the center of the bullseye/crosshair, not the badge center.\n\n"
         "[Reference point map]\n"
         "The user may refer to these clicked locations as 'point N on image M', "
         "'Nth position on the Mth image', or similar phrasing.\n"
@@ -338,7 +438,14 @@ def build_point_reference_text(prepared_images: list[dict]) -> str | None:
     )
 
 
-def call_gemini(api_key: str, model_key: str, images: list, prompt: str, point_reference_text: str | None = None):
+def call_gemini(
+    api_key: str,
+    model_key: str,
+    images: list,
+    prompt: str,
+    point_reference_text: str | None = None,
+    annotated_references: list[dict] | None = None,
+):
     """
     Send one or more images plus a prompt to Gemini.
     images: list of (bytes, mime_type) tuples, in order.
@@ -356,6 +463,24 @@ def call_gemini(api_key: str, model_key: str, images: list, prompt: str, point_r
 
     for img_bytes, mime_type in images:
         parts.append(types.Part.from_bytes(data=img_bytes, mime_type=mime_type))
+
+    if annotated_references:
+        parts.append(
+            types.Part.from_text(
+                text=(
+                    "[Annotated reference images]\n"
+                    "The next images are numbered overlays matching the uploaded originals.\n"
+                    "Use the bullseye center at each numbered marker as the exact target location."
+                )
+            )
+        )
+        for reference in annotated_references:
+            parts.append(
+                types.Part.from_text(
+                    text=f"Annotated reference for Image {reference['image_number']} ({reference['image_ordinal']} uploaded image)."
+                )
+            )
+            parts.append(types.Part.from_bytes(data=reference["png_bytes"], mime_type="image/png"))
 
     if point_reference_text:
         parts.append(types.Part.from_text(text=point_reference_text))
@@ -402,7 +527,12 @@ def call_gemini(api_key: str, model_key: str, images: list, prompt: str, point_r
     raise RuntimeError(f"Gemini returned no image or text content.{reason_suffix}")
 
 
-def render_saved_result(result_slot, cost_slot, show_empty_hint: bool = True) -> None:
+def render_saved_result(
+    result_slot,
+    cost_slot,
+    show_empty_hint: bool = True,
+    allow_reuse_result: bool = True,
+) -> None:
     """Render the latest successful result so it survives reruns."""
     latest_result = st.session_state.get("latest_result")
 
@@ -414,22 +544,32 @@ def render_saved_result(result_slot, cost_slot, show_empty_hint: bool = True) ->
 
     with result_slot.container():
         st.image(latest_result["png_bytes"], caption="Result", use_container_width=True)
-        download_col, reuse_col = st.columns(2)
-        download_col.download_button(
-            "Download result (PNG)",
-            data=latest_result["png_bytes"],
-            file_name="edited_result.png",
-            mime="image/png",
-            use_container_width=True,
-            key="download_latest_result",
-        )
-        if reuse_col.button(
-            "Use Result As New Input",
-            use_container_width=True,
-            key="reuse_latest_result",
-        ):
-            stage_latest_result_as_input()
-            st.rerun()
+        if allow_reuse_result:
+            download_col, reuse_col = st.columns(2)
+            download_col.download_button(
+                "Download result (PNG)",
+                data=latest_result["png_bytes"],
+                file_name="edited_result.png",
+                mime="image/png",
+                use_container_width=True,
+                key="download_latest_result",
+            )
+            if reuse_col.button(
+                "Use Result As New Input",
+                use_container_width=True,
+                key="reuse_latest_result",
+            ):
+                stage_latest_result_as_input()
+                st.rerun()
+        else:
+            st.download_button(
+                "Download result (PNG)",
+                data=latest_result["png_bytes"],
+                file_name="edited_result.png",
+                mime="image/png",
+                use_container_width=True,
+                key="download_latest_result",
+            )
         st.caption(
             f"Saved in the workspace at `{latest_result['workspace_path']}` "
             "until the next successful edit or `Start New`."
@@ -485,6 +625,9 @@ if "selected_account_idx" not in st.session_state or st.session_state["selected_
 if "selected_model_idx" not in st.session_state or st.session_state["selected_model_idx"] >= len(MODEL_KEYS):
     st.session_state["selected_model_idx"] = DEFAULT_IDX
 
+if "editor_mode_idx" not in st.session_state or st.session_state["editor_mode_idx"] >= len(EDITOR_MODES):
+    st.session_state["editor_mode_idx"] = DEFAULT_EDITOR_MODE
+
 if "uploader_version" not in st.session_state:
     st.session_state["uploader_version"] = 0
 
@@ -515,6 +658,22 @@ with st.sidebar:
         st.session_state["selected_account_idx"] = 0
         st.session_state["selected_model_idx"] = DEFAULT_IDX
         st.rerun()
+
+    st.divider()
+
+    st.subheader("Mode")
+    selected_editor_mode_idx = st.selectbox(
+        "Choose mode",
+        options=range(len(EDITOR_MODES)),
+        format_func=lambda i: EDITOR_MODES[i].capitalize(),
+        label_visibility="collapsed",
+        key="editor_mode_idx",
+    )
+    editor_mode = EDITOR_MODES[selected_editor_mode_idx]
+    if editor_mode == "basic":
+        st.caption("Basic mode matches the original upload-and-prompt editor.")
+    else:
+        st.caption("Advanced mode adds point picking, annotated references, and result reuse.")
 
     st.divider()
 
@@ -554,6 +713,7 @@ st.header("Gemini Image Editor")
 left, right = st.columns(2, gap="large")
 prepared_images = []
 point_reference_text = None
+annotated_references = []
 
 with left:
     st.subheader("Input")
@@ -573,7 +733,7 @@ with left:
     if uploaded_files:
         image_sources = get_uploaded_image_sources(uploaded_files)
         st.session_state["staged_input_images"] = []
-    elif st.session_state["staged_input_images"]:
+    elif editor_mode == "advanced" and st.session_state["staged_input_images"]:
         image_sources = st.session_state["staged_input_images"]
         st.caption("Using the latest generated result as the current input image.")
 
@@ -581,70 +741,93 @@ with left:
     sync_point_state([image["id"] for image in prepared_images])
 
     if prepared_images:
-        st.caption(
-            "Click on each image to drop numbered reference points. "
-            "Those exact positions will be sent to Gemini with your prompt."
-        )
-
-        image_views = st.tabs([f"Image {image['index']}" for image in prepared_images])
-        for image, image_view in zip(prepared_images, image_views):
-            with image_view:
-                points = st.session_state["image_points"].get(image["id"], [])
-                click_value = streamlit_image_coordinates(
-                    render_point_preview(image["pil_image"], points),
-                    key=f"image_clicks_{image['id']}",
-                    use_column_width="always",
-                    cursor="crosshair",
-                )
-                if register_point_click(image["id"], click_value, image["size"]):
-                    st.rerun()
-
-                points = st.session_state["image_points"].get(image["id"], [])
-                st.caption(f"Original size: {image['size'][0]} x {image['size'][1]}")
-                if points:
-                    for point_number, point in enumerate(points, start=1):
-                        st.caption(
-                            f"Point {point_number}: x={point['x']}, y={point['y']} "
-                            f"({point['x_normalized']:.3f}, {point['y_normalized']:.3f})"
-                        )
-                else:
-                    st.caption("No points added yet.")
-
-                undo_col, clear_col = st.columns(2)
-                if undo_col.button(
-                    "Undo last point",
-                    key=f"undo_point_{image['id']}",
-                    use_container_width=True,
-                    disabled=not points,
-                ):
-                    st.session_state["image_points"][image["id"]] = points[:-1]
-                    st.rerun()
-
-                if clear_col.button(
-                    "Clear points",
-                    key=f"clear_points_{image['id']}",
-                    use_container_width=True,
-                    disabled=not points,
-                ):
-                    st.session_state["image_points"][image["id"]] = []
-                    st.rerun()
-
-        point_reference_text = build_point_reference_text(prepared_images)
-        if point_reference_text:
+        if editor_mode == "advanced":
             st.caption(
-                "Prompt example: `Change the animal at point 2 on image 3.` "
-                "The coordinate map below is added automatically."
+                "Click on each image to drop numbered reference points. "
+                "Those exact positions will be sent to Gemini with your prompt."
             )
-            with st.expander("Point map sent to Gemini"):
-                st.code(point_reference_text, language="text")
+
+            image_views = st.tabs([f"Image {image['index']}" for image in prepared_images])
+            for image, image_view in zip(prepared_images, image_views):
+                with image_view:
+                    points = st.session_state["image_points"].get(image["id"], [])
+                    click_value = streamlit_image_coordinates(
+                        render_point_preview(image["pil_image"], points),
+                        key=f"image_clicks_{image['id']}",
+                        use_column_width="always",
+                        cursor="crosshair",
+                    )
+                    if register_point_click(image["id"], click_value, image["size"]):
+                        st.rerun()
+
+                    points = st.session_state["image_points"].get(image["id"], [])
+                    st.caption(f"Original size: {image['size'][0]} x {image['size'][1]}")
+                    if points:
+                        for point_number, point in enumerate(points, start=1):
+                            st.caption(
+                                f"Point {point_number}: x={point['x']}, y={point['y']} "
+                                f"({point['x_normalized']:.3f}, {point['y_normalized']:.3f})"
+                            )
+                    else:
+                        st.caption("No points added yet.")
+
+                    undo_col, clear_col = st.columns(2)
+                    if undo_col.button(
+                        "Undo last point",
+                        key=f"undo_point_{image['id']}",
+                        use_container_width=True,
+                        disabled=not points,
+                    ):
+                        st.session_state["image_points"][image["id"]] = points[:-1]
+                        st.rerun()
+
+                    if clear_col.button(
+                        "Clear points",
+                        key=f"clear_points_{image['id']}",
+                        use_container_width=True,
+                        disabled=not points,
+                    ):
+                        st.session_state["image_points"][image["id"]] = []
+                        st.rerun()
+
+            point_reference_text = build_point_reference_text(prepared_images)
+            annotated_references = build_annotated_reference_images(prepared_images)
+            if point_reference_text:
+                st.caption(
+                    "Prompt example: `Change the animal at point 2 on image 3.` "
+                    "A numbered overlay image and the coordinate map below are added automatically."
+                )
+                with st.expander("Point map sent to Gemini"):
+                    st.code(point_reference_text, language="text")
+                with st.expander("Annotated reference images sent to Gemini"):
+                    for reference in annotated_references:
+                        st.image(
+                            reference["png_bytes"],
+                            caption=f"Annotated reference for Image {reference['image_number']}",
+                            use_container_width=True,
+                        )
+        else:
+            if len(prepared_images) == 1:
+                st.image(prepared_images[0]["raw"], caption="Image 1", use_container_width=True)
+            else:
+                columns = st.columns(len(prepared_images))
+                for image, column in zip(prepared_images, columns):
+                    column.image(image["raw"], caption=f"Image {image['index']}", use_container_width=True)
 
     with st.form("edit_form"):
         prompt = st.text_area(
             "What should change?",
             placeholder=(
-                "Single image:  Make the sky look like a sunset\n"
-                "With points:   Change the animal at point 2 on image 3\n"
-                "Multi-image:   Use the person from Image 1 and the building from Image 2, place them on a beach"
+                (
+                    "Single image:  Make the sky look like a sunset\n"
+                    "Multi-image:   Use the person from Image 1 and the building from Image 2, place them on a beach"
+                )
+                if editor_mode == "basic"
+                else (
+                    "Single image:  Make the sky look like a sunset\n"
+                    "With points:   Change the animal at point 2 on image 3\n"
+                    "Multi-image:   Use the person from Image 1 and the building from Image 2, place them on a beach"
+                )
             ),
             height=130,
             key="edit_prompt",
@@ -680,6 +863,10 @@ if submit:
             estimate_image_input_tokens(selected_model, image["size"][0], image["size"][1])
             for image in prepared_images
         )
+        total_img_tokens += sum(
+            estimate_image_input_tokens(selected_model, reference["size"][0], reference["size"][1])
+            for reference in annotated_references
+        )
 
         try:
             with st.spinner(f"Editing with **{cfg['label']}** ..."):
@@ -689,6 +876,7 @@ if submit:
                     images,
                     prompt.strip(),
                     point_reference_text=point_reference_text,
+                    annotated_references=annotated_references,
                 )
         except Exception as exc:
             exc_str = str(exc)
@@ -765,4 +953,9 @@ if notice_type:
         if notice_caption:
             st.caption(notice_caption)
 
-render_saved_result(result_slot, cost_slot, show_empty_hint=not bool(notice_type))
+render_saved_result(
+    result_slot,
+    cost_slot,
+    show_empty_hint=not bool(notice_type),
+    allow_reuse_result=(editor_mode == "advanced"),
+)
