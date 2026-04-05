@@ -54,7 +54,7 @@ MODELS = {
 MODEL_KEYS = list(MODELS.keys())
 DEFAULT_IDX = 0
 EDITOR_MODES = ["basic", "advanced"]
-DEFAULT_EDITOR_MODE = 1
+DEFAULT_EDITOR_MODE = 0
 
 
 def load_costs() -> dict:
@@ -733,7 +733,7 @@ with left:
     if uploaded_files:
         image_sources = get_uploaded_image_sources(uploaded_files)
         st.session_state["staged_input_images"] = []
-    elif editor_mode == "advanced" and st.session_state["staged_input_images"]:
+    elif st.session_state["staged_input_images"]:
         image_sources = st.session_state["staged_input_images"]
         st.caption("Using the latest generated result as the current input image.")
 
@@ -957,5 +957,5 @@ render_saved_result(
     result_slot,
     cost_slot,
     show_empty_hint=not bool(notice_type),
-    allow_reuse_result=(editor_mode == "advanced"),
+    allow_reuse_result=True,
 )
