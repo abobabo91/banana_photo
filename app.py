@@ -55,6 +55,25 @@ MODEL_KEYS = list(MODELS.keys())
 DEFAULT_IDX = 0
 EDITOR_MODES = ["basic", "advanced"]
 DEFAULT_EDITOR_MODE = 0
+OUTPUT_RESOLUTION_OPTIONS = [
+    ("max", "Max"),
+    ("match_input", "Match Input"),
+    ("1K", "1K"),
+    ("2K", "2K"),
+    ("4K", "4K"),
+    ("model_default", "Model Default"),
+]
+OUTPUT_RESOLUTION_KEYS = [key for key, _ in OUTPUT_RESOLUTION_OPTIONS]
+DEFAULT_OUTPUT_RESOLUTION_IDX = 0
+IMAGE_SIZE_STEPS = [
+    ("1K", 1024),
+    ("2K", 2048),
+    ("4K", 4096),
+]
+MAX_IMAGE_SIZE_BY_MODEL = {
+    "gemini-3.1-flash-image-preview": "4K",
+    "gemini-3-pro-image-preview": "4K",
+}
 
 
 def load_costs() -> dict:
@@ -97,6 +116,54 @@ def estimate_image_input_tokens(model_key: str, width: int, height: int) -> int:
 
     crop_unit = max(1, math.floor(min(width, height) / 1.5))
     return math.ceil(width / crop_unit) * math.ceil(height / crop_unit) * 258
+
+
+def clamp_image_size(requested_size: str, max_supported_size: str) -> str:
+    """Clamp a requested image size to the model's supported maximum."""
+    step_order = [size for size, _ in IMAGE_SIZE_STEPS]
+    requested_idx = step_order.index(requested_size)
+    max_supported_idx = step_order.index(max_supported_size)
+    return step_order[min(requested_idx, max_supported_idx)]
+
+
+def match_input_image_size(image_sizes: list[tuple[int, int]]) -> str:
+    """Round the largest input image dimension up to the nearest supported Gemini size."""
+    largest_dimension = max(max(width, height) for width, height in image_sizes)
+    for size_key, size_dimension in IMAGE_SIZE_STEPS:
+        if largest_dimension <= size_dimension:
+            return size_key
+    return IMAGE_SIZE_STEPS[-1][0]
+
+
+def resolve_requested_image_size(
+    model_key: str,
+    output_resolution_key: str,
+    image_sizes: list[tuple[int, int]],
+) -> str | None:
+    """Resolve the requested Gemini image size for the chosen model and sidebar setting."""
+    max_supported_size = MAX_IMAGE_SIZE_BY_MODEL.get(model_key)
+    if not max_supported_size:
+        return None
+
+    if output_resolution_key == "model_default":
+        return None
+    if output_resolution_key == "max":
+        return max_supported_size
+    if output_resolution_key == "match_input":
+        if not image_sizes:
+            return max_supported_size
+        return clamp_image_size(match_input_image_size(image_sizes), max_supported_size)
+    if output_resolution_key in {size for size, _ in IMAGE_SIZE_STEPS}:
+        return clamp_image_size(output_resolution_key, max_supported_size)
+    return max_supported_size
+
+
+def build_generation_config(model_key: str, requested_image_size: str | None) -> types.GenerateContentConfig:
+    """Build the Gemini generation config, adding image size only when the model supports it."""
+    config_kwargs = {"response_modalities": ["TEXT", "IMAGE"]}
+    if requested_image_size and model_key in MAX_IMAGE_SIZE_BY_MODEL:
+        config_kwargs["image_config"] = types.ImageConfig(image_size=requested_image_size)
+    return types.GenerateContentConfig(**config_kwargs)
 
 
 def estimate_output_tokens(model_key: str, width: int, height: int, usage_output_tok: int) -> int:
@@ -443,6 +510,7 @@ def call_gemini(
     model_key: str,
     images: list,
     prompt: str,
+    requested_image_size: str | None = None,
     point_reference_text: str | None = None,
     annotated_references: list[dict] | None = None,
 ):
@@ -490,7 +558,7 @@ def call_gemini(
     response = client.models.generate_content(
         model=model_key,
         contents=parts,
-        config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]),
+        config=build_generation_config(model_key, requested_image_size),
     )
 
     candidates = getattr(response, "candidates", None) or []
@@ -628,6 +696,12 @@ if "selected_model_idx" not in st.session_state or st.session_state["selected_mo
 if "editor_mode_idx" not in st.session_state or st.session_state["editor_mode_idx"] >= len(EDITOR_MODES):
     st.session_state["editor_mode_idx"] = DEFAULT_EDITOR_MODE
 
+if (
+    "output_resolution_idx" not in st.session_state
+    or st.session_state["output_resolution_idx"] >= len(OUTPUT_RESOLUTION_KEYS)
+):
+    st.session_state["output_resolution_idx"] = DEFAULT_OUTPUT_RESOLUTION_IDX
+
 if "uploader_version" not in st.session_state:
     st.session_state["uploader_version"] = 0
 
@@ -705,6 +779,30 @@ with st.sidebar:
 
     st.write(cfg["description"])
     st.text(cfg["price_hint"])
+    st.divider()
+
+    st.subheader("Output Resolution")
+    selected_output_resolution_idx = st.selectbox(
+        "Choose output resolution",
+        options=range(len(OUTPUT_RESOLUTION_KEYS)),
+        format_func=lambda i: OUTPUT_RESOLUTION_OPTIONS[i][1],
+        label_visibility="collapsed",
+        key="output_resolution_idx",
+    )
+    selected_output_resolution = OUTPUT_RESOLUTION_KEYS[selected_output_resolution_idx]
+
+    if selected_model in MAX_IMAGE_SIZE_BY_MODEL:
+        if selected_output_resolution == "max":
+            st.caption(f"Requests {MAX_IMAGE_SIZE_BY_MODEL[selected_model]} output for this model.")
+        elif selected_output_resolution == "match_input":
+            st.caption("Rounds the largest input image up to the nearest supported Gemini size and caps it at the model maximum.")
+        elif selected_output_resolution == "model_default":
+            st.caption("Lets Gemini choose the output size. Google's current docs say the default is 1K.")
+        else:
+            resolved_size = resolve_requested_image_size(selected_model, selected_output_resolution, [])
+            st.caption(f"Requests {resolved_size} output for this model.")
+    else:
+        st.caption("This model uses Gemini's native output size. The Gemini API docs currently describe it as about 1K output.")
     if not cfg.get("pricing_available", True):
         st.write("Current Google pricing marks image generation for this legacy model as unavailable.")
 
@@ -857,6 +955,11 @@ if submit:
         notice_message = "Enter a prompt before editing."
     else:
         api_key = st.secrets[ACCOUNTS[selected_account]["secret_key"]]
+        requested_image_size = resolve_requested_image_size(
+            selected_model,
+            selected_output_resolution,
+            [image["size"] for image in prepared_images],
+        )
 
         images = [(image["raw"], image["mime_type"]) for image in prepared_images]
         total_img_tokens = sum(
@@ -875,6 +978,7 @@ if submit:
                     selected_model,
                     images,
                     prompt.strip(),
+                    requested_image_size=requested_image_size,
                     point_reference_text=point_reference_text,
                     annotated_references=annotated_references,
                 )
