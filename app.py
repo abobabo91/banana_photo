@@ -63,8 +63,8 @@ OUTPUT_RESOLUTION_OPTIONS = [
     ("4K", "4K"),
     ("model_default", "Model Default"),
 ]
-OUTPUT_RESOLUTION_KEYS = [key for key, _ in OUTPUT_RESOLUTION_OPTIONS]
-DEFAULT_OUTPUT_RESOLUTION_IDX = 0
+OUTPUT_RESOLUTION_LABELS = {key: label for key, label in OUTPUT_RESOLUTION_OPTIONS}
+DEFAULT_OUTPUT_RESOLUTION_KEY = "max"
 IMAGE_SIZE_STEPS = [
     ("1K", 1024),
     ("2K", 2048),
@@ -74,6 +74,29 @@ MAX_IMAGE_SIZE_BY_MODEL = {
     "gemini-3.1-flash-image-preview": "4K",
     "gemini-3-pro-image-preview": "4K",
 }
+
+
+class GeminiEmptyResponseError(RuntimeError):
+    """Raised when Gemini returns no image bytes and no text."""
+
+    def __init__(self, message: str, debug_summary: dict):
+        super().__init__(message)
+        self.debug_summary = debug_summary
+
+
+def get_output_resolution_options_for_model(model_key: str) -> list[str]:
+    """Return the sidebar output-resolution choices supported by the selected model."""
+    max_supported_size = MAX_IMAGE_SIZE_BY_MODEL.get(model_key)
+    if not max_supported_size:
+        return ["max", "model_default"]
+
+    options = ["max", "match_input"]
+    for size_key, _ in IMAGE_SIZE_STEPS:
+        options.append(size_key)
+        if size_key == max_supported_size:
+            break
+    options.append("model_default")
+    return options
 
 
 def load_costs() -> dict:
@@ -104,6 +127,69 @@ def save_workspace_result(image_bytes: bytes) -> str:
     RESULTS_DIR.mkdir(exist_ok=True)
     RESULT_IMAGE_FILE.write_bytes(image_bytes)
     return RESULT_IMAGE_FILE.relative_to(APP_DIR).as_posix()
+
+
+def inject_compact_sidebar_styles() -> None:
+    """Tighten the Streamlit sidebar spacing so controls fit with less scrolling."""
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] .block-container {
+            padding-top: 0.8rem;
+            padding-bottom: 0.7rem;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+            gap: 0.35rem;
+        }
+
+        [data-testid="stSidebar"] h1 {
+            font-size: 1.3rem;
+            margin: 0 0 0.15rem 0;
+        }
+
+        [data-testid="stSidebar"] h3 {
+            font-size: 0.76rem;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            margin: 0.3rem 0 0.05rem 0;
+        }
+
+        [data-testid="stSidebar"] hr {
+            margin: 0.3rem 0;
+        }
+
+        [data-testid="stSidebar"] p,
+        [data-testid="stSidebar"] label,
+        [data-testid="stSidebar"] pre {
+            line-height: 1.2;
+        }
+
+        [data-testid="stSidebar"] .stButton,
+        [data-testid="stSidebar"] .stSelectbox,
+        [data-testid="stSidebar"] .stCaption,
+        [data-testid="stSidebar"] .stMarkdown,
+        [data-testid="stSidebar"] .stText {
+            margin-bottom: 0;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stWidgetLabel"] {
+            margin-bottom: 0.1rem;
+        }
+
+        [data-testid="stSidebar"] [data-baseweb="select"] > div {
+            min-height: 2.1rem;
+        }
+
+        [data-testid="stSidebar"] button[kind] {
+            min-height: 2.1rem;
+            padding-top: 0.2rem;
+            padding-bottom: 0.2rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def estimate_image_input_tokens(model_key: str, width: int, height: int) -> int:
@@ -156,6 +242,130 @@ def resolve_requested_image_size(
     if output_resolution_key in {size for size, _ in IMAGE_SIZE_STEPS}:
         return clamp_image_size(output_resolution_key, max_supported_size)
     return max_supported_size
+
+
+def enum_value(value):
+    """Return a stable printable value for SDK enums and plain strings alike."""
+    return getattr(value, "value", value)
+
+
+def summarize_gemini_part(part) -> str:
+    """Describe a Gemini response part for debugging."""
+    descriptors = []
+
+    part_text = getattr(part, "text", None)
+    if part_text is not None:
+        descriptors.append(f"text({len(part_text)} chars)")
+
+    inline_data = getattr(part, "inline_data", None)
+    if inline_data is not None:
+        mime_type = getattr(inline_data, "mime_type", None) or "unknown"
+        inline_bytes = getattr(inline_data, "data", None) or b""
+        descriptors.append(f"inline_data({mime_type}, {len(inline_bytes)} bytes)")
+
+    if getattr(part, "file_data", None) is not None:
+        descriptors.append("file_data")
+    if getattr(part, "function_call", None) is not None:
+        descriptors.append("function_call")
+    if getattr(part, "function_response", None) is not None:
+        descriptors.append("function_response")
+    if getattr(part, "executable_code", None) is not None:
+        descriptors.append("executable_code")
+    if getattr(part, "code_execution_result", None) is not None:
+        descriptors.append("code_execution_result")
+
+    return ", ".join(descriptors) or "empty_part"
+
+
+def build_gemini_debug_summary(response, requested_image_size: str | None = None) -> dict:
+    """Summarize a Gemini response so empty-content failures are debuggable."""
+    prompt_feedback = getattr(response, "prompt_feedback", None)
+    usage = getattr(response, "usage_metadata", None)
+    candidates = getattr(response, "candidates", None) or []
+
+    summary = {
+        "response_id": getattr(response, "response_id", None),
+        "model_version": getattr(response, "model_version", None),
+        "requested_image_size": requested_image_size,
+        "prompt_feedback": None,
+        "usage": {
+            "prompt_token_count": getattr(usage, "prompt_token_count", None),
+            "candidates_token_count": getattr(usage, "candidates_token_count", None),
+            "total_token_count": getattr(usage, "total_token_count", None),
+        },
+        "candidates": [],
+    }
+
+    if prompt_feedback is not None:
+        summary["prompt_feedback"] = {
+            "block_reason": enum_value(getattr(prompt_feedback, "block_reason", None)),
+            "block_reason_message": getattr(prompt_feedback, "block_reason_message", None),
+        }
+
+    for candidate in candidates:
+        safety_ratings = []
+        for rating in getattr(candidate, "safety_ratings", None) or []:
+            safety_ratings.append(
+                {
+                    "category": enum_value(getattr(rating, "category", None)),
+                    "probability": enum_value(getattr(rating, "probability", None)),
+                    "blocked": getattr(rating, "blocked", None),
+                }
+            )
+
+        content = getattr(candidate, "content", None)
+        parts = getattr(content, "parts", None) or []
+        summary["candidates"].append(
+            {
+                "index": getattr(candidate, "index", None),
+                "finish_reason": enum_value(getattr(candidate, "finish_reason", None)),
+                "finish_message": getattr(candidate, "finish_message", None),
+                "parts": [summarize_gemini_part(part) for part in parts],
+                "safety_ratings": safety_ratings,
+            }
+        )
+
+    return summary
+
+
+def format_gemini_empty_response_message(debug_summary: dict) -> str:
+    """Build a readable error from a Gemini response that produced no usable content."""
+    details = []
+
+    prompt_feedback = debug_summary.get("prompt_feedback") or {}
+    if prompt_feedback.get("block_reason"):
+        block_reason = prompt_feedback["block_reason"]
+        block_reason_message = prompt_feedback.get("block_reason_message")
+        if block_reason_message:
+            details.append(f"Prompt blocked: {block_reason} ({block_reason_message}).")
+        else:
+            details.append(f"Prompt blocked: {block_reason}.")
+
+    candidate_details = []
+    for candidate in debug_summary.get("candidates", []):
+        reason = candidate.get("finish_reason") or "unknown"
+        finish_message = candidate.get("finish_message")
+        if finish_message:
+            candidate_details.append(f"candidate {candidate.get('index', '?')}: {reason} ({finish_message})")
+        else:
+            candidate_details.append(f"candidate {candidate.get('index', '?')}: {reason}")
+
+    if candidate_details:
+        details.append("Candidates: " + "; ".join(candidate_details) + ".")
+
+    requested_image_size = debug_summary.get("requested_image_size")
+    if requested_image_size:
+        details.append(f"Requested output size: {requested_image_size}.")
+        if requested_image_size == "4K":
+            details.append("If this keeps happening, try `2K` or `Model Default` in the sidebar.")
+
+    response_id = debug_summary.get("response_id")
+    if response_id:
+        details.append(f"Response ID: {response_id}.")
+
+    if not details:
+        return "Gemini returned no image or text content."
+    return "Gemini returned no image or text content. " + " ".join(details)
 
 
 def build_generation_config(model_key: str, requested_image_size: str | None) -> types.GenerateContentConfig:
@@ -586,13 +796,13 @@ def call_gemini(
     if fallback_text:
         return None, fallback_text, getattr(response, "usage_metadata", None)
 
-    finish_reasons = [
-        str(getattr(candidate, "finish_reason", "unknown"))
-        for candidate in candidates
-        if getattr(candidate, "finish_reason", None) is not None
-    ]
-    reason_suffix = f" Finish reason: {', '.join(finish_reasons)}." if finish_reasons else ""
-    raise RuntimeError(f"Gemini returned no image or text content.{reason_suffix}")
+    debug_summary = build_gemini_debug_summary(response, requested_image_size=requested_image_size)
+    print("Gemini empty response summary:", flush=True)
+    print(json.dumps(debug_summary, indent=2, default=str), flush=True)
+    raise GeminiEmptyResponseError(
+        format_gemini_empty_response_message(debug_summary),
+        debug_summary,
+    )
 
 
 def render_saved_result(
@@ -611,7 +821,7 @@ def render_saved_result(
         return
 
     with result_slot.container():
-        st.image(latest_result["png_bytes"], caption="Result", use_container_width=True)
+        st.image(latest_result["png_bytes"], caption="Result", width="stretch")
         if allow_reuse_result:
             download_col, reuse_col = st.columns(2)
             download_col.download_button(
@@ -619,12 +829,12 @@ def render_saved_result(
                 data=latest_result["png_bytes"],
                 file_name="edited_result.png",
                 mime="image/png",
-                use_container_width=True,
+                width="stretch",
                 key="download_latest_result",
             )
             if reuse_col.button(
                 "Use Result As New Input",
-                use_container_width=True,
+                width="stretch",
                 key="reuse_latest_result",
             ):
                 stage_latest_result_as_input()
@@ -635,7 +845,7 @@ def render_saved_result(
                 data=latest_result["png_bytes"],
                 file_name="edited_result.png",
                 mime="image/png",
-                use_container_width=True,
+                width="stretch",
                 key="download_latest_result",
             )
         st.caption(
@@ -675,6 +885,7 @@ st.set_page_config(
     page_icon="*",
     layout="wide",
 )
+inject_compact_sidebar_styles()
 
 # Seed from disk once per browser session so totals survive app restarts.
 if "costs_loaded" not in st.session_state:
@@ -696,11 +907,8 @@ if "selected_model_idx" not in st.session_state or st.session_state["selected_mo
 if "editor_mode_idx" not in st.session_state or st.session_state["editor_mode_idx"] >= len(EDITOR_MODES):
     st.session_state["editor_mode_idx"] = DEFAULT_EDITOR_MODE
 
-if (
-    "output_resolution_idx" not in st.session_state
-    or st.session_state["output_resolution_idx"] >= len(OUTPUT_RESOLUTION_KEYS)
-):
-    st.session_state["output_resolution_idx"] = DEFAULT_OUTPUT_RESOLUTION_IDX
+if "output_resolution_key" not in st.session_state:
+    st.session_state["output_resolution_key"] = DEFAULT_OUTPUT_RESOLUTION_KEY
 
 if "uploader_version" not in st.session_state:
     st.session_state["uploader_version"] = 0
@@ -719,7 +927,7 @@ with st.sidebar:
     st.caption("A thin wrapper around Google Gemini's native image editing.")
     st.divider()
 
-    if st.button("Start New", use_container_width=True):
+    if st.button("Start New", width="stretch"):
         clear_workspace_result()
         for key in list(st.session_state.keys()):
             del st.session_state[key]
@@ -761,8 +969,10 @@ with st.sidebar:
     )
     selected_account = ACCOUNT_KEYS[selected_account_idx]
 
-    st.caption(f"Barabasi total: ${st.session_state['total_spent_barabasi']:.2f}")
-    st.caption(f"Abel total: ${st.session_state['total_spent_abel']:.2f}")
+    st.caption(
+        f"Spend: Barabasi ${st.session_state['total_spent_barabasi']:.2f} | "
+        f"Abel ${st.session_state['total_spent_abel']:.2f}"
+    )
 
     st.divider()
 
@@ -776,20 +986,22 @@ with st.sidebar:
     )
     selected_model = MODEL_KEYS[selected_model_idx]
     cfg = MODELS[selected_model]
+    available_output_resolution_options = get_output_resolution_options_for_model(selected_model)
+    if st.session_state["output_resolution_key"] not in available_output_resolution_options:
+        st.session_state["output_resolution_key"] = DEFAULT_OUTPUT_RESOLUTION_KEY
 
-    st.write(cfg["description"])
-    st.text(cfg["price_hint"])
+    st.caption(cfg["description"])
+    st.caption(cfg["price_hint"].replace("\n", "  \n"))
     st.divider()
 
     st.subheader("Output Resolution")
-    selected_output_resolution_idx = st.selectbox(
+    selected_output_resolution = st.selectbox(
         "Choose output resolution",
-        options=range(len(OUTPUT_RESOLUTION_KEYS)),
-        format_func=lambda i: OUTPUT_RESOLUTION_OPTIONS[i][1],
+        options=available_output_resolution_options,
+        format_func=lambda key: OUTPUT_RESOLUTION_LABELS[key],
         label_visibility="collapsed",
-        key="output_resolution_idx",
+        key="output_resolution_key",
     )
-    selected_output_resolution = OUTPUT_RESOLUTION_KEYS[selected_output_resolution_idx]
 
     if selected_model in MAX_IMAGE_SIZE_BY_MODEL:
         if selected_output_resolution == "max":
@@ -802,7 +1014,10 @@ with st.sidebar:
             resolved_size = resolve_requested_image_size(selected_model, selected_output_resolution, [])
             st.caption(f"Requests {resolved_size} output for this model.")
     else:
-        st.caption("This model uses Gemini's native output size. The Gemini API docs currently describe it as about 1K output.")
+        if selected_output_resolution == "max":
+            st.caption("Uses this model's native maximum output. Google's current docs describe it as up to about 1K.")
+        else:
+            st.caption("Lets Gemini choose the native output size for this model. Google's current docs describe it as about 1K.")
     if not cfg.get("pricing_available", True):
         st.write("Current Google pricing marks image generation for this legacy model as unavailable.")
 
@@ -873,7 +1088,7 @@ with left:
                     if undo_col.button(
                         "Undo last point",
                         key=f"undo_point_{image['id']}",
-                        use_container_width=True,
+                        width="stretch",
                         disabled=not points,
                     ):
                         st.session_state["image_points"][image["id"]] = points[:-1]
@@ -882,7 +1097,7 @@ with left:
                     if clear_col.button(
                         "Clear points",
                         key=f"clear_points_{image['id']}",
-                        use_container_width=True,
+                        width="stretch",
                         disabled=not points,
                     ):
                         st.session_state["image_points"][image["id"]] = []
@@ -902,15 +1117,15 @@ with left:
                         st.image(
                             reference["png_bytes"],
                             caption=f"Annotated reference for Image {reference['image_number']}",
-                            use_container_width=True,
+                            width="stretch",
                         )
         else:
             if len(prepared_images) == 1:
-                st.image(prepared_images[0]["raw"], caption="Image 1", use_container_width=True)
+                st.image(prepared_images[0]["raw"], caption="Image 1", width="stretch")
             else:
                 columns = st.columns(len(prepared_images))
                 for image, column in zip(prepared_images, columns):
-                    column.image(image["raw"], caption=f"Image {image['index']}", use_container_width=True)
+                    column.image(image["raw"], caption=f"Image {image['index']}", width="stretch")
 
     with st.form("edit_form"):
         prompt = st.text_area(
@@ -933,7 +1148,7 @@ with left:
         submit = st.form_submit_button(
             "Edit Image",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
 with right:
@@ -993,6 +1208,13 @@ if submit:
                     "- **Use a smaller image** — large images take longer to process and are more likely to time out\n"
                     "- **Switch to Gemini 2.5 Flash Image** in the sidebar — it's the stable production model and handles load better than the preview models\n"
                     "- **Try a different model** if one preview model keeps failing"
+                )
+            elif isinstance(exc, GeminiEmptyResponseError):
+                notice_type = "warning"
+                notice_message = str(exc)
+                notice_caption = (
+                    "The full Gemini response summary was printed to the terminal for debugging. "
+                    "If you're using `Max`, try `2K` or `Model Default` once to see if the model returns content."
                 )
             else:
                 notice_type = "error"
